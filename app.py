@@ -18,7 +18,7 @@ from src.preprocessing import (
 )
 from src.peak_fitting import (
     detect_peaks, fit_peaks, segment_fit, calculate_peak_areas,
-    gaussian, lorentzian, voigt,
+    gaussian, lorentzian, voigt, deconvolve_peaks,
 )
 from src.phase_identification import (
     identify_phases, match_phases, estimate_phase_abundance,
@@ -525,7 +525,18 @@ elif page == "🧹 光谱预处理":
 
 elif page == "📊 峰检测与拟合":
     st.title("📊 峰检测与拟合")
-    st.markdown("自动寻峰、峰型拟合（高斯/洛伦兹/Voigt）、分段拟合")
+    st.markdown("自动寻峰、峰型拟合（高斯/洛伦兹/Voigt）、分段拟合、峰解卷积")
+    
+    if 'deconvolution_selected' not in st.session_state:
+        st.session_state.deconvolution_selected = set()
+    if 'deconvolution_result' not in st.session_state:
+        st.session_state.deconvolution_result = None
+    if 'pre_deconvolution_peaks' not in st.session_state:
+        st.session_state.pre_deconvolution_peaks = None
+    if 'pre_deconvolution_fitted' not in st.session_state:
+        st.session_state.pre_deconvolution_fitted = None
+    if 'pre_deconvolution_r2' not in st.session_state:
+        st.session_state.pre_deconvolution_r2 = None
     
     if not st.session_state.spectra:
         st.warning("请先导入数据")
@@ -559,6 +570,9 @@ elif page == "📊 峰检测与拟合":
                     min_peak_distance=min_peak_distance,
                 )
                 st.session_state.peak_results = peaks
+                st.session_state.deconvolution_selected = set()
+                st.session_state.deconvolution_result = None
+                st.session_state.pre_deconvolution_peaks = None
                 st.success(f"检测到 {len(peaks)} 个峰")
             
             st.markdown("---")
@@ -591,8 +605,79 @@ elif page == "📊 峰检测与拟合":
                 st.session_state.fitted_peaks = fitted_peaks
                 st.session_state.fitted_curve = y_fitted
                 st.session_state.fit_r_squared = r2
+                st.session_state.deconvolution_selected = set()
+                st.session_state.deconvolution_result = None
+                st.session_state.pre_deconvolution_peaks = None
                 
                 st.success(f"拟合完成，R² = {r2:.4f}")
+            
+            st.markdown("---")
+            
+            st.subheader("峰解卷积")
+            
+            selected_set = st.session_state.deconvolution_selected
+            display_peaks_all = st.session_state.fitted_peaks or st.session_state.peak_results
+            
+            if display_peaks_all:
+                selected_count = len(selected_set)
+                st.info(f"已选择 {selected_count} 个峰（需要2-5个相邻重叠峰）")
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    disable_deconv = not (2 <= selected_count <= 5)
+                    if st.button("🔬 解卷积", disabled=disable_deconv, type="primary",
+                                 help="对选中的2-5个相邻重叠峰进行约束优化分解"):
+                        selected_indices = sorted(selected_set)
+                        selected_peaks_list = [display_peaks_all[i] for i in selected_indices]
+                        
+                        st.session_state.pre_deconvolution_peaks = [p.copy() for p in display_peaks_all]
+                        if st.session_state.fitted_curve is not None:
+                            st.session_state.pre_deconvolution_fitted = st.session_state.fitted_curve.copy()
+                            st.session_state.pre_deconvolution_r2 = st.session_state.fit_r_squared
+                        
+                        deconv_result = deconvolve_peaks(
+                            current_spec.x, current_spec.y,
+                            selected_peaks_list, peak_type,
+                        )
+                        
+                        if deconv_result['success']:
+                            deconv_peaks = deconv_result['deconvolved_peaks']
+                            for idx_in_selected, orig_idx in enumerate(selected_indices):
+                                if orig_idx < len(display_peaks_all):
+                                    orig_peak = display_peaks_all[orig_idx]
+                                    new_peak_data = deconv_peaks[idx_in_selected]
+                                    for k, v in new_peak_data.items():
+                                        orig_peak[k] = v
+                            
+                            if st.session_state.fitted_peaks:
+                                st.session_state.fitted_peaks = display_peaks_all
+                            
+                            st.session_state.deconvolution_result = deconv_result
+                            st.success(deconv_result['message'])
+                            st.rerun()
+                        else:
+                            st.error(deconv_result['message'])
+                
+                with col_b:
+                    disable_reset = st.session_state.pre_deconvolution_peaks is None
+                    if st.button("↺ 重置解卷积", disabled=disable_reset,
+                                 help="恢复到解卷积前的峰参数状态"):
+                        if st.session_state.pre_deconvolution_peaks is not None:
+                            if st.session_state.fitted_peaks:
+                                st.session_state.fitted_peaks = st.session_state.pre_deconvolution_peaks
+                            else:
+                                st.session_state.peak_results = st.session_state.pre_deconvolution_peaks
+                            
+                            if st.session_state.pre_deconvolution_fitted is not None:
+                                st.session_state.fitted_curve = st.session_state.pre_deconvolution_fitted
+                                st.session_state.fit_r_squared = st.session_state.pre_deconvolution_r2
+                            
+                            st.session_state.deconvolution_result = None
+                            st.session_state.pre_deconvolution_peaks = None
+                            st.success("已恢复到解卷积前的状态")
+                            st.rerun()
+            else:
+                st.info("请先运行自动寻峰或拟合峰")
             
             st.markdown("---")
             
@@ -613,12 +698,87 @@ elif page == "📊 峰检测与拟合":
                 peaks=peaks_to_show,
                 fitted_curve=fitted_curve,
             )
+            
+            if peaks_to_show and st.session_state.deconvolution_selected:
+                selected_indices = sorted(st.session_state.deconvolution_selected)
+                selected_x = [peaks_to_show[i]['position'] for i in selected_indices if i < len(peaks_to_show)]
+                selected_y = [peaks_to_show[i]['intensity'] for i in selected_indices if i < len(peaks_to_show)]
+                fig.add_trace(go.Scatter(
+                    x=selected_x, y=selected_y,
+                    mode='markers',
+                    name='选中待解卷积',
+                    marker=dict(color='orange', size=12, symbol='star',
+                                line=dict(color='black', width=1)),
+                ))
+            
             st.plotly_chart(fig, use_container_width=True)
             
             if st.session_state.fit_r_squared is not None:
                 st.metric("拟合优度 R²", f"{st.session_state.fit_r_squared:.4f}")
             
-            if st.session_state.fitted_peaks and fitted_curve is not None:
+            if st.session_state.deconvolution_result and st.session_state.deconvolution_result['success']:
+                deconv = st.session_state.deconvolution_result
+                
+                st.markdown("#### 解卷积结果")
+                
+                x_seg = deconv['sum_curve']['x']
+                y_seg = current_spec.y[(current_spec.x >= deconv['x_range'][0]) & (current_spec.x <= deconv['x_range'][1])]
+                
+                fig_deconv = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    row_heights=[0.7, 0.3],
+                    vertical_spacing=0.05,
+                    subplot_titles=("解卷积分量分解", "残差"),
+                )
+                
+                fig_deconv.add_trace(go.Scatter(
+                    x=x_seg, y=y_seg,
+                    mode='lines',
+                    name='原始数据',
+                    line=dict(color='#1f77b4', width=2.5),
+                ), row=1, col=1)
+                
+                colors = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+                for i, comp in enumerate(deconv['component_curves']):
+                    fig_deconv.add_trace(go.Scatter(
+                        x=comp['x'], y=comp['y'],
+                        mode='lines',
+                        name=f'分量 {i+1}',
+                        line=dict(color=colors[i % len(colors)], width=1.5, dash='dash'),
+                    ), row=1, col=1)
+                
+                fig_deconv.add_trace(go.Scatter(
+                    x=deconv['sum_curve']['x'], y=deconv['sum_curve']['y'],
+                    mode='lines',
+                    name='分量之和',
+                    line=dict(color='green', width=2.0),
+                ), row=1, col=1)
+                
+                fig_deconv.add_trace(go.Scatter(
+                    x=deconv['residual']['x'], y=deconv['residual']['y'],
+                    mode='lines',
+                    name='残差',
+                    line=dict(color='red', width=1.2),
+                    fill='tozeroy',
+                    fillcolor='rgba(255,0,0,0.1)',
+                ), row=2, col=1)
+                
+                fig_deconv.update_layout(
+                    height=500,
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=10, r=10, t=40, b=40),
+                )
+                fig_deconv.update_xaxes(title_text=current_spec.x_unit, row=2, col=1)
+                fig_deconv.update_yaxes(title_text="强度", row=1, col=1)
+                fig_deconv.update_yaxes(title_text="残差", row=2, col=1)
+                
+                st.plotly_chart(fig_deconv, use_container_width=True)
+                
+                st.metric("解卷积拟合优度 R²", f"{deconv['r_squared']:.4f}")
+            
+            if st.session_state.fitted_peaks and fitted_curve is not None and st.session_state.deconvolution_result is None:
                 residual = current_spec.y - fitted_curve
                 fig_res = plot_spectrum(
                     current_spec.x, residual,
@@ -634,21 +794,55 @@ elif page == "📊 峰检测与拟合":
             
             display_peaks = st.session_state.fitted_peaks or st.session_state.peak_results
             
+            selected_set = st.session_state.deconvolution_selected
+            if len(selected_set) >= len(display_peaks):
+                selected_set = set()
+                st.session_state.deconvolution_selected = selected_set
+            
             peak_data = []
             for i, peak in enumerate(display_peaks):
                 pos = peak.get('position', peak.get('peak_energy', 0))
                 inten = peak.get('intensity', peak.get('peak_intensity', 0))
                 fwhm = peak.get('fwhm', peak.get('fwhm_estimate', None))
+                is_deconvolved = peak.get('deconvolved', False)
+                is_selected = i in selected_set
                 
                 peak_data.append({
+                    "选择": is_selected,
                     "序号": i + 1,
                     "峰位": round(pos, 4),
                     "强度": round(inten, 2),
                     "半高宽(FWHM)": round(fwhm, 4) if fwhm else "-",
+                    "状态": "✅ 已解卷积" if is_deconvolved else "",
                 })
             
             df = pd.DataFrame(peak_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            column_config = {
+                "选择": st.column_config.CheckboxColumn(
+                    "选择",
+                    help="勾选2-5个相邻重叠峰进行解卷积",
+                    default=False,
+                )
+            }
+            
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                column_config=column_config,
+                disabled=["序号", "峰位", "强度", "半高宽(FWHM)", "状态"],
+            )
+            
+            new_selected = set()
+            for i, row in edited_df.iterrows():
+                if row.get("选择", False):
+                    if 2 <= len(display_peaks):
+                        new_selected.add(i)
+            
+            if new_selected != selected_set:
+                st.session_state.deconvolution_selected = new_selected
+                st.rerun()
             
             if st.session_state.fitted_peaks:
                 areas = calculate_peak_areas(

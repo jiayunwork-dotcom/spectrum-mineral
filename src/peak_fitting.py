@@ -397,3 +397,207 @@ def calculate_peak_areas(x: np.ndarray, fitted_peaks: List[Dict],
         areas.append(float(area))
     
     return areas
+
+
+def deconvolve_peaks(x: np.ndarray, y: np.ndarray,
+                     selected_peaks: List[Dict],
+                     peak_type: str = 'gaussian',
+                     background: bool = True) -> Dict:
+    """
+    峰解卷积：对重叠的多个峰进行约束优化分解
+    
+    参数:
+        x: x轴全部数据
+        y: y轴全部数据
+        selected_peaks: 选中的待解卷积峰列表 (2-5个)
+        peak_type: 峰类型 'gaussian', 'lorentzian', 'voigt'
+        background: 是否拟合线性背景
+    
+    返回:
+        字典包含:
+        - deconvolved_peaks: 解卷积后的峰参数列表
+        - component_curves: 各独立峰分量曲线 (x, y列表的列表)
+        - sum_curve: 各分量之和的曲线
+        - residual: 残差曲线 (原始数据 - 拟合和)
+        - r_squared: 拟合优度R²
+        - x_range: 解卷积使用的x轴范围 [x_min, x_max]
+        - success: 是否成功
+        - message: 提示信息
+    """
+    n_selected = len(selected_peaks)
+    result = {
+        'deconvolved_peaks': [],
+        'component_curves': [],
+        'sum_curve': None,
+        'residual': None,
+        'r_squared': 0.0,
+        'x_range': None,
+        'success': False,
+        'message': '',
+    }
+    
+    if n_selected < 2 or n_selected > 5:
+        result['message'] = f'请选择2-5个峰进行解卷积（当前选择了{n_selected}个）'
+        return result
+    
+    sorted_peaks = sorted(selected_peaks, key=lambda p: p['position'])
+    positions = np.array([p['position'] for p in sorted_peaks])
+    fwhms = np.array([p.get('fwhm', p.get('fwhm_estimate', 0.01)) for p in sorted_peaks])
+    intensities = np.array([p['intensity'] for p in sorted_peaks])
+    
+    leftmost = positions[0] - 3.0 * max(fwhms[0], (positions[1] - positions[0]) if n_selected > 1 else 0.01)
+    rightmost = positions[-1] + 3.0 * max(fwhms[-1], (positions[-1] - positions[-2]) if n_selected > 1 else 0.01)
+    
+    mask = (x >= leftmost) & (x <= rightmost)
+    x_seg = x[mask]
+    y_seg = y[mask]
+    
+    if len(x_seg) < 10:
+        result['message'] = '解卷积区间数据点不足，请选择更合适的峰'
+        return result
+    
+    result['x_range'] = [float(leftmost), float(rightmost)]
+    
+    num_peaks = n_selected
+    p0 = []
+    bounds_lower = []
+    bounds_upper = []
+    
+    for i, peak in enumerate(sorted_peaks):
+        init_intensity = max(float(intensities[i]), 1e-6)
+        p0.append(init_intensity)
+        bounds_lower.append(1e-8)
+        bounds_upper.append(np.inf)
+        
+        init_pos = float(positions[i])
+        init_fwhm = max(float(fwhms[i]), 1e-6)
+        pos_tol = 0.5 * init_fwhm
+        p0.append(init_pos)
+        bounds_lower.append(init_pos - pos_tol)
+        bounds_upper.append(init_pos + pos_tol)
+        
+        if peak_type == 'voigt':
+            p0.append(init_fwhm * 0.5)
+            p0.append(init_fwhm * 0.5)
+            bounds_lower.extend([0.3 * init_fwhm * 0.5, 0.3 * init_fwhm * 0.5])
+            bounds_upper.extend([3.0 * init_fwhm * 0.5, 3.0 * init_fwhm * 0.5])
+        else:
+            p0.append(init_fwhm)
+            bounds_lower.append(0.3 * init_fwhm)
+            bounds_upper.append(3.0 * init_fwhm)
+    
+    if background:
+        y_seg_mean = float(np.mean(y_seg))
+        p0.extend([y_seg_mean * 0.1, 0.0])
+        data_range = float(np.max(y_seg) - np.min(y_seg)) if np.max(y_seg) > np.min(y_seg) else 1.0
+        bounds_lower.extend([-5.0 * data_range, -data_range / (x_seg[-1] - x_seg[0] + 1e-10)])
+        bounds_upper.extend([5.0 * data_range, data_range / (x_seg[-1] - x_seg[0] + 1e-10)])
+    
+    def residual(params):
+        y_fit = _combined_peaks(x_seg, params, num_peaks, peak_type, background)
+        return y_seg - y_fit
+    
+    try:
+        opt_result = optimize.least_squares(
+            residual, p0,
+            bounds=(bounds_lower, bounds_upper),
+            method='trf',
+            max_nfev=5000,
+            ftol=1e-10,
+            xtol=1e-10,
+        )
+        
+        fitted_params = opt_result.x
+        y_sum = _combined_peaks(x_seg, fitted_params, num_peaks, peak_type, background)
+        
+        ss_res = np.sum(opt_result.fun ** 2)
+        ss_tot = np.sum((y_seg - np.mean(y_seg)) ** 2)
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        
+        deconvolved = []
+        param_idx = 0
+        for i in range(num_peaks):
+            intensity = float(max(fitted_params[param_idx], 0.0))
+            center = float(fitted_params[param_idx + 1])
+            
+            if peak_type == 'voigt':
+                g_fwhm = float(fitted_params[param_idx + 2])
+                l_fwhm = float(fitted_params[param_idx + 3])
+                fwhm = 0.5346 * l_fwhm + np.sqrt(0.2166 * l_fwhm ** 2 + g_fwhm ** 2)
+                peak_dict = {
+                    'position': center,
+                    'intensity': intensity,
+                    'fwhm': float(fwhm),
+                    'gaussian_fwhm': g_fwhm,
+                    'lorentzian_fwhm': l_fwhm,
+                    'deconvolved': True,
+                    'original_index': sorted_peaks[i].get('index', i),
+                }
+                param_idx += 4
+            else:
+                fwhm = float(fitted_params[param_idx + 2])
+                peak_dict = {
+                    'position': center,
+                    'intensity': intensity,
+                    'fwhm': fwhm,
+                    'deconvolved': True,
+                    'original_index': sorted_peaks[i].get('index', i),
+                }
+                param_idx += 3
+            
+            deconvolved.append(peak_dict)
+        
+        if background:
+            param_idx += 2
+        
+        component_curves = []
+        for i in range(num_peaks):
+            single_params = []
+            p_i = 0
+            for j in range(num_peaks):
+                if j == i:
+                    if peak_type == 'voigt':
+                        single_params.extend([
+                            deconvolved[j]['intensity'],
+                            deconvolved[j]['position'],
+                            deconvolved[j].get('gaussian_fwhm', deconvolved[j]['fwhm'] * 0.5),
+                            deconvolved[j].get('lorentzian_fwhm', deconvolved[j]['fwhm'] * 0.5),
+                        ])
+                    else:
+                        single_params.extend([
+                            deconvolved[j]['intensity'],
+                            deconvolved[j]['position'],
+                            deconvolved[j]['fwhm'],
+                        ])
+                else:
+                    if peak_type == 'voigt':
+                        single_params.extend([0.0, deconvolved[j]['position'], 1e-6, 1e-6])
+                    else:
+                        single_params.extend([0.0, deconvolved[j]['position'], 1e-6])
+            
+            if background:
+                bg_offset = 0.0
+                bg_slope = 0.0
+                if len(fitted_params) >= 2:
+                    bg_offset = float(fitted_params[-2])
+                    bg_slope = float(fitted_params[-1])
+                single_params.extend([bg_offset, bg_slope])
+            
+            single_y = _combined_peaks(x_seg, np.array(single_params), num_peaks, peak_type, background)
+            component_curves.append({'x': x_seg.copy(), 'y': single_y.copy()})
+        
+        residual_curve = y_seg - y_sum
+        
+        result['deconvolved_peaks'] = deconvolved
+        result['component_curves'] = component_curves
+        result['sum_curve'] = {'x': x_seg.copy(), 'y': y_sum.copy()}
+        result['residual'] = {'x': x_seg.copy(), 'y': residual_curve.copy()}
+        result['r_squared'] = float(r_squared)
+        result['success'] = True
+        result['message'] = f'解卷积成功，R² = {r_squared:.4f}'
+        
+        return result
+    
+    except Exception as e:
+        result['message'] = f'解卷积失败: {str(e)}'
+        return result
