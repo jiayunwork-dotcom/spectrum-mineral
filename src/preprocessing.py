@@ -26,7 +26,10 @@ class BaselineCorrection(PreprocessingStep):
     
     def __init__(self, method: str = "als", **kwargs):
         self.method = method
-        self.params = {"method": method, **kwargs}
+        params = {"method": method, **kwargs}
+        if "lambda_" in params:
+            params["lambda"] = params.pop("lambda_")
+        self.params = params
     
     def apply(self, x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         method = self.params.get("method", "als")
@@ -157,26 +160,93 @@ class Normalization(PreprocessingStep):
 
 
 class PreprocessingPipeline:
-    """预处理流水线，支持步骤组合和顺序调整"""
+    """预处理流水线，支持步骤组合和顺序调整，支持撤销/重做"""
     
     def __init__(self, steps: Optional[List[PreprocessingStep]] = None):
         self.steps: List[PreprocessingStep] = steps or []
-        self.history: List[List[Dict]] = []
+        self._history: List[List[Dict]] = [self.to_dict_list()]
+        self._history_index: int = 0
+        self._max_history: int = 50
+    
+    def _save_state(self):
+        """保存当前状态到历史记录（操作前调用）"""
+        if self._history_index < len(self._history) - 1:
+            self._history = self._history[:self._history_index + 1]
+        
+        self._history_index += 1
+    
+    def _commit_state(self):
+        """提交当前状态到历史记录（操作后调用）"""
+        state = self.to_dict_list()
+        if self._history_index < len(self._history):
+            self._history[self._history_index] = state
+        else:
+            self._history.append(state)
+        
+        if len(self._history) > self._max_history:
+            self._history.pop(0)
+            self._history_index -= 1
+    
+    def undo(self) -> bool:
+        """撤销到上一个状态"""
+        if self.can_undo:
+            self._history_index -= 1
+            state = self._history[self._history_index]
+            self._load_state(state)
+            return True
+        return False
+    
+    def redo(self) -> bool:
+        """重做"""
+        if self.can_redo:
+            self._history_index += 1
+            state = self._history[self._history_index]
+            self._load_state(state)
+            return True
+        return False
+    
+    @property
+    def can_undo(self) -> bool:
+        """是否可以撤销"""
+        return self._history_index > 0
+    
+    @property
+    def can_redo(self) -> bool:
+        """是否可以重做"""
+        return self._history_index < len(self._history) - 1
+    
+    def _load_state(self, state: List[Dict]):
+        """从状态列表加载步骤"""
+        new_pipeline = PreprocessingPipeline.from_dict_list(state)
+        self.steps = new_pipeline.steps
     
     def add_step(self, step: PreprocessingStep, position: Optional[int] = None):
+        self._save_state()
         if position is None:
             self.steps.append(step)
         else:
             self.steps.insert(position, step)
+        self._commit_state()
     
     def remove_step(self, index: int):
         if 0 <= index < len(self.steps):
+            self._save_state()
             self.steps.pop(index)
+            self._commit_state()
     
     def move_step(self, from_idx: int, to_idx: int):
         if 0 <= from_idx < len(self.steps) and 0 <= to_idx < len(self.steps):
+            self._save_state()
             step = self.steps.pop(from_idx)
             self.steps.insert(to_idx, step)
+            self._commit_state()
+    
+    def clear_steps(self):
+        """清空所有步骤"""
+        if self.steps:
+            self._save_state()
+            self.steps = []
+            self._commit_state()
     
     def apply(self, spectrum: Spectrum) -> Spectrum:
         result = spectrum.copy()
@@ -215,8 +285,10 @@ class PreprocessingPipeline:
         steps = []
         for d in dict_list:
             name = d.get("name", "")
-            params = d.get("params", {})
+            params = d.get("params", {}).copy()
             if name == "baseline_correction":
+                if "lambda" in params:
+                    params["lambda_"] = params.pop("lambda")
                 steps.append(BaselineCorrection(**params))
             elif name == "smoothing":
                 steps.append(Smoothing(**params))

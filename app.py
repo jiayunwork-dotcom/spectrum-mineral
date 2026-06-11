@@ -367,6 +367,22 @@ elif page == "🧹 光谱预处理":
             
             st.markdown("---")
             
+            col_undo, col_redo, col_clear = st.columns(3)
+            with col_undo:
+                if st.button("↩️ 撤销", disabled=not pipeline.can_undo, help="撤销上一步操作"):
+                    pipeline.undo()
+                    st.rerun()
+            with col_redo:
+                if st.button("↪️ 重做", disabled=not pipeline.can_redo, help="重做已撤销的操作"):
+                    pipeline.redo()
+                    st.rerun()
+            with col_clear:
+                if st.button("🗑️ 清空", disabled=not pipeline.steps, help="清空所有步骤"):
+                    pipeline.clear_steps()
+                    st.rerun()
+            
+            st.markdown("---")
+            
             if pipeline.steps:
                 st.write(f"当前步骤数: {len(pipeline.steps)}")
                 
@@ -387,34 +403,37 @@ elif page == "🧹 光谱预处理":
                             if st.button("🗑️ 删除", key=f"del_{i}"):
                                 pipeline.remove_step(i)
                                 st.rerun()
-                
-                if st.button("清空所有步骤"):
-                    st.session_state.preprocessing_pipeline = PreprocessingPipeline()
-                    st.rerun()
             else:
                 st.info("暂无预处理步骤，请添加")
         
         with col2:
             st.subheader("实时预览")
             
-            preview_step = st.slider(
-                "预览到第几步",
-                0, max(0, len(pipeline.steps)),
-                value=len(pipeline.steps),
-                help="拖动滑块查看每一步的效果",
-            )
-            
-            if pipeline.steps and preview_step > 0:
-                preview_spec = pipeline.apply_step(current_spec, preview_step - 1)
+            if pipeline.steps:
+                preview_step = st.slider(
+                    "预览到第几步",
+                    0, len(pipeline.steps),
+                    value=len(pipeline.steps),
+                    help="拖动滑块查看每一步的效果",
+                )
             else:
-                preview_spec = current_spec
+                preview_step = 0
+                st.info("暂无预处理步骤，请在左侧添加")
             
-            fig = plot_spectrum(
-                preview_spec.x, preview_spec.y,
-                title=f"{current_spec.name} - 预处理预览 (步骤 {preview_step})",
-                x_label=preview_spec.x_unit,
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            try:
+                if pipeline.steps and preview_step > 0:
+                    preview_spec = pipeline.apply_step(current_spec, preview_step - 1)
+                else:
+                    preview_spec = current_spec
+                
+                fig = plot_spectrum(
+                    preview_spec.x, preview_spec.y,
+                    title=f"{current_spec.name} - 预处理预览 (步骤 {preview_step})",
+                    x_label=preview_spec.x_unit,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"预览渲染出错: {str(e)}")
             
             col_a, col_b = st.columns(2)
             with col_a:

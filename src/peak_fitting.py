@@ -12,7 +12,7 @@ def detect_peaks(x: np.ndarray, y: np.ndarray,
                  sensitivity: float = 3.0, 
                  min_peak_distance: float = 0.0) -> List[Dict]:
     """
-    基于二阶导数过零点检测的自动寻峰算法
+    自动寻峰算法（结合局部最大值检测与信噪比阈值）
     
     参数:
         x: x轴数据
@@ -26,35 +26,29 @@ def detect_peaks(x: np.ndarray, y: np.ndarray,
     y = np.asarray(y, dtype=float)
     x = np.asarray(x, dtype=float)
     
-    noise = np.std(y[:min(50, len(y))])
+    if len(y) < 3:
+        return []
+    
+    noise = _estimate_noise(y)
     if noise < 1e-10:
         noise = 1e-10
     
     threshold = sensitivity * noise
     
-    second_deriv = np.gradient(np.gradient(y, x), x)
-    
-    sign_changes = np.diff(np.sign(second_deriv))
-    zero_crossings = np.where(sign_changes != 0)[0]
+    baseline = _estimate_baseline(y)
+    y_centered = y - baseline
     
     peak_indices = []
-    for zc in zero_crossings:
-        if zc + 1 < len(second_deriv):
-            if second_deriv[zc] > 0 and second_deriv[zc + 1] < 0:
-                peak_indices.append(zc + 1)
+    for i in range(1, len(y) - 1):
+        if y[i] > y[i - 1] and y[i] >= y[i + 1]:
+            if y_centered[i] > threshold:
+                peak_indices.append(i)
     
-    peaks = []
-    for idx in peak_indices:
-        if 0 < idx < len(y) - 1:
-            if y[idx] > y[idx - 1] and y[idx] > y[idx + 1]:
-                if y[idx] > threshold:
-                    peaks.append(idx)
-    
-    if min_peak_distance > 0:
-        peaks = _filter_by_distance(x, y, peaks, min_peak_distance)
+    if min_peak_distance > 0 and len(peak_indices) > 0:
+        peak_indices = _filter_by_distance(x, y, peak_indices, min_peak_distance)
     
     result = []
-    for idx in peaks:
+    for idx in peak_indices:
         fwhm = _estimate_fwhm(x, y, idx)
         result.append({
             'position': float(x[idx]),
@@ -64,6 +58,46 @@ def detect_peaks(x: np.ndarray, y: np.ndarray,
         })
     
     return result
+
+
+def _estimate_noise(y: np.ndarray) -> float:
+    """
+    鲁棒的噪声估计
+    使用数据中较低部分的标准差作为噪声估计，避免峰的影响
+    """
+    y_sorted = np.sort(y)
+    n = len(y_sorted)
+    low_portion = y_sorted[:max(1, n // 4)]
+    noise = np.std(low_portion)
+    
+    if noise < 1e-10:
+        noise = np.std(y) * 0.1
+    
+    return float(noise)
+
+
+def _estimate_baseline(y: np.ndarray) -> np.ndarray:
+    """
+    简单的基线估计（用于峰检测）
+    使用滚动最小值的方法
+    """
+    n = len(y)
+    if n < 10:
+        return np.zeros_like(y)
+    
+    window = max(3, n // 20)
+    if window % 2 == 0:
+        window += 1
+    
+    baseline = np.zeros_like(y)
+    half = window // 2
+    
+    for i in range(n):
+        left = max(0, i - half)
+        right = min(n, i + half + 1)
+        baseline[i] = np.min(y[left:right])
+    
+    return baseline
 
 
 def _filter_by_distance(x: np.ndarray, y: np.ndarray, 
