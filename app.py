@@ -1668,6 +1668,14 @@ elif page == "📄 报告导出":
     
     col1, col2 = st.columns([1, 1])
     
+    deconv_has_result = (
+        'deconvolution_result' in st.session_state
+        and st.session_state.deconvolution_result is not None
+        and st.session_state.deconvolution_result.get('success', False)
+        and 'pre_deconvolution_peaks' in st.session_state
+        and st.session_state.pre_deconvolution_peaks is not None
+    )
+    
     with col1:
         st.subheader("报告设置")
         
@@ -1680,6 +1688,12 @@ elif page == "📄 报告导出":
         include_spectrum_plot = st.checkbox("光谱图", value=True)
         include_preprocessing = st.checkbox("预处理参数", value=True)
         include_peak_results = st.checkbox("峰检测结果", value=True)
+        include_deconvolution = st.checkbox(
+            "峰解卷积分析",
+            value=deconv_has_result,
+            disabled=not deconv_has_result,
+            help="只有对样品执行解卷积分析后才能包含该部分",
+        )
         include_phase_results = st.checkbox("物相鉴定结果", value=True)
         include_quantitative = st.checkbox("定量结果", value=True)
     
@@ -1687,19 +1701,27 @@ elif page == "📄 报告导出":
         st.subheader("预览")
         st.info("报告将以PDF格式生成，包含矢量光谱图")
         
+        if deconv_has_result:
+            st.success("✅ 检测到峰解卷积分析结果，可在报告中包含")
+        else:
+            st.info("💡 提示：在「峰检测与拟合」页面对重叠峰执行解卷积后，可在此报告中包含解卷积分析结果")
+        
         if st.button("📄 生成PDF报告", type="primary"):
             if not st.session_state.spectra:
                 st.warning("请先导入数据")
             else:
                 current_spec = st.session_state.spectra[st.session_state.current_spectrum_idx]
                 
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
-                    tmp_path = tmp.name
+                tmp_path = None
+                tmp_deconv_path = None
                 
                 try:
                     import matplotlib
                     matplotlib.use('Agg')
                     import matplotlib.pyplot as plt
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+                        tmp_path = tmp.name
                     
                     fig, ax = plt.subplots(figsize=(10, 6))
                     ax.plot(current_spec.x, current_spec.y)
@@ -1711,6 +1733,53 @@ elif page == "📄 报告导出":
                     plt.savefig(tmp_path, dpi=150)
                     plt.close()
                     
+                    deconv_result_for_report = None
+                    deconv_before_for_report = None
+                    
+                    if include_deconvolution and deconv_has_result:
+                        deconv = st.session_state.deconvolution_result
+                        deconv_result_for_report = deconv
+                        deconv_before_for_report = st.session_state.pre_deconvolution_peaks
+                        
+                        x_seg = deconv['sum_curve']['x']
+                        mask_seg = (current_spec.x >= deconv['x_range'][0]) & (current_spec.x <= deconv['x_range'][1])
+                        y_seg = current_spec.y[mask_seg]
+                        
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_d:
+                            tmp_deconv_path = tmp_d.name
+                        
+                        fig_d = plt.figure(figsize=(10, 7))
+                        gs = fig_d.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.1)
+                        ax_top = fig_d.add_subplot(gs[0])
+                        ax_bot = fig_d.add_subplot(gs[1], sharex=ax_top)
+                        
+                        ax_top.plot(x_seg, y_seg, color='#1f77b4', linewidth=2.0, label='原始数据')
+                        
+                        colors = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+                        for i, comp in enumerate(deconv['component_curves']):
+                            ax_top.plot(comp['x'], comp['y'], color=colors[i % len(colors)],
+                                        linestyle='--', linewidth=1.2, label=f'分量 {i+1}')
+                        
+                        ax_top.plot(deconv['sum_curve']['x'], deconv['sum_curve']['y'],
+                                    color='green', linewidth=1.8, label='分量之和')
+                        ax_top.set_ylabel('强度')
+                        ax_top.legend(loc='upper right', fontsize=8, ncol=2)
+                        ax_top.grid(True, alpha=0.3)
+                        ax_top.set_title(f"峰解卷积结果 (R²={deconv['r_squared']:.4f})")
+                        
+                        ax_bot.plot(deconv['residual']['x'], deconv['residual']['y'],
+                                    color='red', linewidth=1.0)
+                        ax_bot.fill_between(deconv['residual']['x'], deconv['residual']['y'],
+                                            alpha=0.15, color='red')
+                        ax_bot.axhline(y=0, color='black', linewidth=0.5, linestyle='-')
+                        ax_bot.set_xlabel(current_spec.x_unit)
+                        ax_bot.set_ylabel('残差')
+                        ax_bot.grid(True, alpha=0.3)
+                        
+                        plt.tight_layout()
+                        plt.savefig(tmp_deconv_path, dpi=150)
+                        plt.close(fig_d)
+                    
                     sample_info = {
                         "样品名称": current_spec.name,
                         "光谱类型": current_spec.spectrum_type.value,
@@ -1721,7 +1790,7 @@ elif page == "📄 报告导出":
                     
                     preprocessing_params = st.session_state.preprocessing_pipeline.to_dict_list() if st.session_state.preprocessing_pipeline.steps else []
                     
-                    peak_results = st.session_state.peak_results or []
+                    peak_results = st.session_state.fitted_peaks or st.session_state.peak_results or []
                     phase_results = st.session_state.phase_results or []
                     quant_results = st.session_state.quant_phase_results if 'quant_phase_results' in st.session_state else []
                     
@@ -1732,6 +1801,9 @@ elif page == "📄 报告导出":
                         peak_results=peak_results if include_peak_results else None,
                         phase_results=phase_results if include_phase_results else None,
                         quantitative_results=quant_results if include_quantitative else None,
+                        deconvolution_result=deconv_result_for_report if include_deconvolution else None,
+                        deconvolution_before_peaks=deconv_before_for_report if include_deconvolution else None,
+                        deconvolution_image_path=tmp_deconv_path if (include_deconvolution and deconv_has_result) else None,
                         title=report_title,
                         notes=report_notes,
                     )
@@ -1749,9 +1821,13 @@ elif page == "📄 报告导出":
                     
                 except Exception as e:
                     st.error(f"生成报告时出错: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
                 finally:
-                    if os.path.exists(tmp_path):
+                    if tmp_path and os.path.exists(tmp_path):
                         os.unlink(tmp_path)
+                    if tmp_deconv_path and os.path.exists(tmp_deconv_path):
+                        os.unlink(tmp_deconv_path)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 关于")

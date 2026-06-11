@@ -14,6 +14,9 @@ def generate_pdf_report(sample_info: Dict,
                         peak_results: Optional[List[Dict]] = None,
                         phase_results: Optional[List[Dict]] = None,
                         quantitative_results: Optional[List[Dict]] = None,
+                        deconvolution_result: Optional[Dict] = None,
+                        deconvolution_before_peaks: Optional[List[Dict]] = None,
+                        deconvolution_image_path: Optional[str] = None,
                         title: str = '光谱分析报告',
                         notes: str = '') -> bytes:
     """
@@ -26,6 +29,9 @@ def generate_pdf_report(sample_info: Dict,
         peak_results: 峰检测结果
         phase_results: 物相鉴定结果
         quantitative_results: 定量结果
+        deconvolution_result: 峰解卷积结果（来自deconvolve_peaks）
+        deconvolution_before_peaks: 解卷积前的峰参数列表
+        deconvolution_image_path: 解卷积可视化图路径
         title: 报告标题
         notes: 备注
     
@@ -164,9 +170,108 @@ def generate_pdf_report(sample_info: Dict,
         ]))
         story.append(peak_table)
     
+    deconvolution_available = (
+        deconvolution_result is not None
+        and deconvolution_result.get('success', False)
+        and deconvolution_before_peaks is not None
+    )
+    
+    if deconvolution_available:
+        story.append(Spacer(1, 15))
+        story.append(Paragraph("五、峰解卷积分析", heading_style))
+        
+        deconv_peaks_after = deconvolution_result.get('deconvolved_peaks', [])
+        deconv_indices = [p.get('original_index', i) for i, p in enumerate(deconv_peaks_after)]
+        
+        story.append(Paragraph("5.1 解卷积前后参数对比", styles['Heading3']))
+        story.append(Spacer(1, 5))
+        
+        comp_data = [['分量', '参数', '解卷积前', '解卷积后', '变化量']]
+        span_commands = []
+        for idx_in_list, after_peak in enumerate(deconv_peaks_after):
+            orig_idx = after_peak.get('original_index', idx_in_list)
+            before_peak = None
+            if orig_idx < len(deconvolution_before_peaks):
+                before_peak = deconvolution_before_peaks[orig_idx]
+            
+            start_row = len(comp_data)
+            for param_key, param_label in [
+                ('position', '峰位'),
+                ('intensity', '强度'),
+                ('fwhm', 'FWHM'),
+            ]:
+                before_val = 0.0
+                if before_peak:
+                    before_val = before_peak.get(param_key, before_peak.get(
+                        'fwhm_estimate' if param_key == 'fwhm' else param_key, 0.0))
+                after_val = after_peak.get(param_key, 0.0)
+                delta = after_val - before_val
+                
+                if param_key == 'position':
+                    before_str = f"{before_val:.4f}"
+                    after_str = f"{after_val:.4f}"
+                    delta_str = f"{delta:+.4f}"
+                elif param_key == 'intensity':
+                    before_str = f"{before_val:.2f}"
+                    after_str = f"{after_val:.2f}"
+                    delta_str = f"{delta:+.2f}"
+                else:
+                    before_str = f"{before_val:.4f}" if isinstance(before_val, (int, float)) else "-"
+                    after_str = f"{after_val:.4f}"
+                    delta_str = f"{delta:+.4f}" if isinstance(before_val, (int, float)) else "-"
+                
+                comp_data.append([
+                    f"分量{idx_in_list + 1}" if param_key == 'position' else "",
+                    param_label,
+                    before_str,
+                    after_str,
+                    delta_str,
+                ])
+            end_row = len(comp_data) - 1
+            if end_row > start_row:
+                span_commands.append(('SPAN', (0, start_row), (0, end_row)))
+        
+        table_style_cmds = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightcyan),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.darkcyan),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('BACKGROUND', (0, 1), (0, -1), colors.whitesmoke),
+        ]
+        table_style_cmds.extend(span_commands)
+        
+        comp_table = Table(comp_data, colWidths=[2.2*cm, 2.5*cm, 3.2*cm, 3.2*cm, 2.5*cm])
+        comp_table.setStyle(TableStyle(table_style_cmds))
+        story.append(comp_table)
+        
+        story.append(Spacer(1, 8))
+        r_squared_val = deconvolution_result.get('r_squared', 0.0)
+        x_range = deconvolution_result.get('x_range', [0, 0])
+        story.append(Paragraph(
+            f"解卷积区间: [{x_range[0]:.3f}, {x_range[1]:.3f}]　　"
+            f"拟合优度 R² = {r_squared_val:.4f}　　"
+            f"分量数: {len(deconv_peaks_after)}",
+            normal_style
+        ))
+        
+        if deconvolution_image_path:
+            story.append(Spacer(1, 10))
+            story.append(Paragraph("5.2 解卷积可视化", styles['Heading3']))
+            story.append(Spacer(1, 5))
+            try:
+                img_deconv = Image(deconvolution_image_path, width=15*cm, height=9*cm)
+                story.append(img_deconv)
+            except:
+                story.append(Paragraph("（解卷积可视化图加载失败）", normal_style))
+    
     if phase_results:
         story.append(Spacer(1, 15))
-        story.append(Paragraph("五、物相鉴定结果", heading_style))
+        next_section_num = "六" if deconvolution_available else "五"
+        story.append(Paragraph(f"{next_section_num}、物相鉴定结果", heading_style))
         phase_data = [['排名', '矿物名称', '化学式', '匹配度', '匹配峰数']]
         for i, result in enumerate(phase_results[:10]):
             card = result.get('card')
@@ -194,7 +299,10 @@ def generate_pdf_report(sample_info: Dict,
     
     if quantitative_results:
         story.append(Spacer(1, 15))
-        story.append(Paragraph("六、定量分析结果", heading_style))
+        quant_section_num = "七" if (deconvolution_available and phase_results) else (
+            "六" if deconvolution_available or phase_results else "五"
+        )
+        story.append(Paragraph(f"{quant_section_num}、定量分析结果", heading_style))
         quant_data = [['组分/元素', '含量', '置信区间', '方法']]
         for result in quantitative_results:
             name = result.get('phase', result.get('element', ''))
@@ -223,7 +331,13 @@ def generate_pdf_report(sample_info: Dict,
     
     if notes:
         story.append(Spacer(1, 15))
-        story.append(Paragraph("七、备注", heading_style))
+        notes_section_num = "八" if (deconvolution_available and phase_results and quantitative_results) else (
+            "七" if ((deconvolution_available and (phase_results or quantitative_results)) or
+                     (phase_results and quantitative_results)) else (
+                "六" if (deconvolution_available or phase_results or quantitative_results) else "五"
+            )
+        )
+        story.append(Paragraph(f"{notes_section_num}、备注", heading_style))
         story.append(Paragraph(notes, normal_style))
     
     doc.build(story)
