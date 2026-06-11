@@ -60,6 +60,10 @@ class AnomalyResult:
         self.q_threshold: float = None
         self.anomaly_indices_q: List[int] = []
         self.anomaly_samples: List[str] = []
+        self.t2_contributions: np.ndarray = None
+        self.q_contributions: np.ndarray = None
+        self.quadrants: List[str] = []
+        self.residual_matrix: np.ndarray = None
 
 
 def interpolate_to_common_grid(
@@ -529,6 +533,215 @@ def compute_q_residuals(
         threshold = np.percentile(Q, 95)
     
     return Q, threshold
+
+
+def compute_t2_contributions(
+    scores: np.ndarray,
+    eigenvalues: np.ndarray,
+    n_components: int = None
+) -> np.ndarray:
+    """
+    计算每个样品在各主成分上对T2统计量的贡献度
+
+    参数:
+        scores: PCA得分矩阵 (n_samples, n_components)
+        eigenvalues: 特征值数组
+        n_components: 使用的主成分数
+
+    返回:
+        T2贡献度矩阵 (n_samples, n_components), contribution_ij = score_ij^2 / eigenvalue_j
+    """
+    if n_components is None:
+        n_components = scores.shape[1]
+
+    scores_subset = scores[:, :n_components]
+    eigenvalues_subset = eigenvalues[:n_components]
+    eigenvalues_subset[eigenvalues_subset < 1e-10] = 1e-10
+
+    contributions = (scores_subset ** 2) / eigenvalues_subset
+
+    return contributions
+
+
+def compute_q_contributions(
+    X_std: np.ndarray,
+    scores: np.ndarray,
+    eigenvectors: np.ndarray,
+    n_components: int = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    计算每个样品在各原始变量上对Q残差的贡献度
+
+    参数:
+        X_std: 标准化后的光谱矩阵 (n_samples, n_features)
+        scores: PCA得分矩阵
+        eigenvectors: 特征向量矩阵
+        n_components: 使用的主成分数
+
+    返回:
+        (Q贡献度矩阵, 残差矩阵)
+        Q贡献度矩阵 (n_samples, n_features), contribution_ij = e_ij^2 (残差平方)
+        残差矩阵 (n_samples, n_features)
+    """
+    if n_components is None:
+        n_components = scores.shape[1]
+
+    eigenvectors_subset = eigenvectors[:, :n_components]
+    X_reconstructed = scores[:, :n_components] @ eigenvectors_subset.T
+    residuals = X_std - X_reconstructed
+    q_contributions = residuals ** 2
+
+    return q_contributions, residuals
+
+
+def classify_quadrant(
+    t2_normalized: np.ndarray,
+    q_normalized: np.ndarray
+) -> List[str]:
+    """
+    根据归一化的T2和Q值判断每个样品所属的象限
+
+    参数:
+        t2_normalized: 归一化T2值数组 (T2/T2_limit)
+        q_normalized: 归一化Q值数组 (Q/Q_limit)
+
+    返回:
+        每个样品的象限标签列表:
+        - 'both': 右上象限 (T2>1 且 Q>1)
+        - 't2_only': 右下象限 (T2>1 且 Q<=1)
+        - 'q_only': 左上象限 (T2<=1 且 Q>1)
+        - 'normal': 左下象限 (T2<=1 且 Q<=1)
+    """
+    quadrants = []
+    for t2n, qn in zip(t2_normalized, q_normalized):
+        if t2n > 1.0 and qn > 1.0:
+            quadrants.append('both')
+        elif t2n > 1.0 and qn <= 1.0:
+            quadrants.append('t2_only')
+        elif t2n <= 1.0 and qn > 1.0:
+            quadrants.append('q_only')
+        else:
+            quadrants.append('normal')
+    return quadrants
+
+
+def compute_moving_average(
+    data: np.ndarray,
+    window: int = 3
+) -> np.ndarray:
+    """
+    计算移动平均
+
+    参数:
+        data: 输入数据数组
+        window: 窗口大小
+
+    返回:
+        移动平均数组 (长度与输入相同，前window-1个为NaN)
+    """
+    if len(data) < window:
+        return np.full(len(data), np.nan)
+
+    ma = np.full(len(data), np.nan)
+    for i in range(window - 1, len(data)):
+        ma[i] = np.mean(data[i - window + 1:i + 1])
+
+    return ma
+
+
+def compute_trend_slope(
+    data: np.ndarray,
+    window: int = None
+) -> Tuple[float, float]:
+    """
+    计算数据的线性趋势斜率
+
+    参数:
+        data: 输入数据数组
+        window: 可选，只计算最后window个点的斜率；None则计算全部
+
+    返回:
+        (总斜率, 最近窗口斜率) 两个斜率值
+    """
+    if len(data) < 2:
+        return 0.0, 0.0
+
+    x_all = np.arange(len(data))
+    valid_mask = ~np.isnan(data)
+    x_valid = x_all[valid_mask]
+    y_valid = data[valid_mask]
+
+    if len(x_valid) < 2:
+        total_slope = 0.0
+    else:
+        total_slope = float(np.polyfit(x_valid, y_valid, 1)[0])
+
+    if window is not None and len(data) >= window:
+        recent_data = data[-window:]
+        x_recent = np.arange(len(recent_data))
+        valid_mask_r = ~np.isnan(recent_data)
+        x_r = x_recent[valid_mask_r]
+        y_r = recent_data[valid_mask_r]
+        if len(x_r) >= 2:
+            recent_slope = float(np.polyfit(x_r, y_r, 1)[0])
+        else:
+            recent_slope = 0.0
+    else:
+        recent_slope = total_slope
+
+    return total_slope, recent_slope
+
+
+def get_top_t2_contributions(
+    t2_contributions: np.ndarray,
+    sample_idx: int,
+    top_k: int = 3
+) -> List[Tuple[int, float]]:
+    """
+    获取指定样品T2贡献度前K的主成分
+
+    参数:
+        t2_contributions: T2贡献度矩阵
+        sample_idx: 样品索引
+        top_k: 返回前K个
+
+    返回:
+        列表 [(主成分编号, 贡献值), ...] 按贡献值降序
+    """
+    contribs = t2_contributions[sample_idx]
+    sorted_idx = np.argsort(contribs)[::-1]
+    result = []
+    for i in range(min(top_k, len(sorted_idx))):
+        pc_idx = int(sorted_idx[i])
+        result.append((pc_idx + 1, float(contribs[pc_idx])))
+    return result
+
+
+def get_top_q_contributions(
+    q_contributions: np.ndarray,
+    common_x: np.ndarray,
+    sample_idx: int,
+    top_k: int = 5
+) -> List[Tuple[float, float]]:
+    """
+    获取指定样品Q贡献度前K的波长/角度位置
+
+    参数:
+        q_contributions: Q贡献度矩阵
+        common_x: x轴坐标数组 (波长/角度)
+        sample_idx: 样品索引
+        top_k: 返回前K个
+
+    返回:
+        列表 [(x坐标, 贡献值), ...] 按贡献值降序
+    """
+    contribs = q_contributions[sample_idx]
+    sorted_idx = np.argsort(contribs)[::-1]
+    result = []
+    for i in range(min(top_k, len(sorted_idx))):
+        var_idx = int(sorted_idx[i])
+        result.append((float(common_x[var_idx]), float(contribs[var_idx])))
+    return result
 
 
 def save_pca_model(

@@ -46,6 +46,9 @@ from src.pca_classification import (
     reconstruct_centroids, calculate_cosine_similarity_centroid,
     compute_confusion_matrix, compute_mahalanobis_distances,
     compute_hotelling_t2, compute_q_residuals,
+    compute_t2_contributions, compute_q_contributions,
+    classify_quadrant, compute_moving_average, compute_trend_slope,
+    get_top_t2_contributions, get_top_q_contributions,
     save_pca_model, load_pca_model, predict_new_sample,
     export_results_to_csv, export_loadings_to_csv, export_variance_to_csv,
 )
@@ -1474,6 +1477,10 @@ elif page == "📊 PCA与分类":
         st.session_state.anomaly_result = None
     if 'pca_model_data' not in st.session_state:
         st.session_state.pca_model_data = None
+    if 'selected_anomaly_idx' not in st.session_state:
+        st.session_state.selected_anomaly_idx = None
+    if 'trend_window' not in st.session_state:
+        st.session_state.trend_window = 3
     
     if len(st.session_state.spectra) < 3:
         st.warning("请至少导入3个样品才能进行PCA分析")
@@ -2088,12 +2095,14 @@ elif page == "📊 PCA与分类":
             else:
                 pca_result = st.session_state.pca_result
                 clustering_result = st.session_state.clustering_result
-                
-                col1, col2 = st.columns([1, 2])
-                
-                with col1:
+                sample_names = [s.name for s in pca_result.selected_spectra]
+                x_unit = pca_result.selected_spectra[0].x_unit if pca_result.selected_spectra else "x"
+
+                col_left, col_right = st.columns([1, 2])
+
+                with col_left:
                     st.subheader("异常检测设置")
-                    
+
                     mahal_std_multiplier = st.slider(
                         "马氏距离阈值 (标准差倍数)",
                         min_value=1.0,
@@ -2101,35 +2110,52 @@ elif page == "📊 PCA与分类":
                         value=3.0,
                         step=0.1,
                     )
-                    
+
+                    enable_trend = st.checkbox(
+                        "启用时序趋势分析",
+                        value=False,
+                        help="如按顺序导入的样品代表时间序列，可启用此功能"
+                    )
+
+                    trend_window = 3
+                    if enable_trend:
+                        trend_window = st.slider(
+                            "移动平均窗口大小",
+                            min_value=2,
+                            max_value=min(10, max(2, len(sample_names) - 1)),
+                            value=3,
+                            step=1,
+                        )
+                        st.session_state.trend_window = trend_window
+
                     if st.button("⚠️ 执行异常检测", type="primary"):
                         with st.spinner("正在进行异常检测..."):
                             anomaly_result = AnomalyResult()
-                            
+
                             mahal_dist, mahal_thresh, anomaly_mahal = compute_mahalanobis_distances(
                                 pca_result.scores,
                                 clustering_result.labels,
                                 clustering_result.centroids_pca
                             )
-                            
+
                             custom_mahal_thresh = mahal_dist.mean() + mahal_std_multiplier * mahal_dist.std()
                             anomaly_mahal_custom = np.where(mahal_dist > custom_mahal_thresh)[0].tolist()
-                            
+
                             anomaly_result.mahalanobis_distances = mahal_dist
                             anomaly_result.mahalanobis_threshold = custom_mahal_thresh
                             anomaly_result.anomaly_indices_mahal = anomaly_mahal_custom
-                            
+
                             t2, t2_thresh = compute_hotelling_t2(
                                 pca_result.scores,
                                 pca_result.eigenvalues,
                                 n_components=pca_result.n_components
                             )
                             anomaly_t2 = np.where(t2 > t2_thresh)[0].tolist()
-                            
+
                             anomaly_result.hotelling_t2 = t2
                             anomaly_result.t2_threshold = t2_thresh
                             anomaly_result.anomaly_indices_t2 = anomaly_t2
-                            
+
                             X_std = (pca_result.spectral_matrix - pca_result.mean) / pca_result.std
                             q_res, q_thresh = compute_q_residuals(
                                 X_std,
@@ -2138,156 +2164,483 @@ elif page == "📊 PCA与分类":
                                 n_components=pca_result.n_components
                             )
                             anomaly_q = np.where(q_res > q_thresh)[0].tolist()
-                            
+
                             anomaly_result.q_residuals = q_res
                             anomaly_result.q_threshold = q_thresh
                             anomaly_result.anomaly_indices_q = anomaly_q
-                            
-                            sample_names = [s.name for s in pca_result.selected_spectra]
+
+                            t2_norm = t2 / t2_thresh
+                            q_norm = q_res / q_thresh
+                            anomaly_result.quadrants = classify_quadrant(t2_norm, q_norm)
+
+                            t2_contrib = compute_t2_contributions(
+                                pca_result.scores,
+                                pca_result.eigenvalues,
+                                n_components=pca_result.n_components
+                            )
+                            anomaly_result.t2_contributions = t2_contrib
+
+                            q_contrib, residuals_mat = compute_q_contributions(
+                                X_std,
+                                pca_result.scores,
+                                pca_result.eigenvectors,
+                                n_components=pca_result.n_components
+                            )
+                            anomaly_result.q_contributions = q_contrib
+                            anomaly_result.residual_matrix = residuals_mat
+
                             anomaly_indices = list(set(anomaly_mahal_custom + anomaly_t2 + anomaly_q))
                             anomaly_result.anomaly_samples = [sample_names[i] for i in anomaly_indices]
-                            
+
                             st.session_state.anomaly_result = anomaly_result
-                            
+                            st.session_state.selected_anomaly_idx = None
+
                             anomaly_count = len(anomaly_indices)
                             if anomaly_count > 0:
                                 st.warning(f"检测到 {anomaly_count} 个潜在异常样品")
                             else:
                                 st.success("未检测到异常样品")
-                
-                with col2:
+
+                with col_right:
                     if st.session_state.anomaly_result:
                         anomaly_result = st.session_state.anomaly_result
-                        sample_names = [s.name for s in pca_result.selected_spectra]
-                        
-                        st.subheader("马氏距离")
-                        
-                        fig_mahal = go.Figure()
-                        
-                        colors = ['#1f77b4' if d <= anomaly_result.mahalanobis_threshold else 'red' 
-                                  for d in anomaly_result.mahalanobis_distances]
-                        
-                        fig_mahal.add_trace(go.Bar(
-                            x=sample_names,
-                            y=anomaly_result.mahalanobis_distances,
-                            marker_color=colors,
-                            hovertemplate='%{x}<br>马氏距离: %{y:.4f}<extra></extra>',
-                        ))
-                        
-                        fig_mahal.add_hline(
-                            y=anomaly_result.mahalanobis_threshold,
+
+                        t2 = anomaly_result.hotelling_t2
+                        t2_thresh = anomaly_result.t2_threshold
+                        q_res = anomaly_result.q_residuals
+                        q_thresh = anomaly_result.q_threshold
+                        t2_norm = t2 / t2_thresh
+                        q_norm = q_res / q_thresh
+                        quadrants = anomaly_result.quadrants
+
+                        quadrant_colors = {
+                            'both': '#d62728',
+                            't2_only': '#ff7f0e',
+                            'q_only': '#ffcc00',
+                            'normal': '#7f7f7f',
+                        }
+                        quadrant_names = {
+                            'both': '双指标超限',
+                            't2_only': '仅T²超限',
+                            'q_only': '仅Q超限',
+                            'normal': '正常',
+                        }
+                        point_colors = [quadrant_colors[q] for q in quadrants]
+
+                        fig_joint = go.Figure()
+
+                        for q_name in ['normal', 't2_only', 'q_only', 'both']:
+                            mask = [q == q_name for q in quadrants]
+                            if not any(mask):
+                                continue
+                            x_vals = [t2_norm[i] for i in range(len(t2_norm)) if mask[i]]
+                            y_vals = [q_norm[i] for i in range(len(q_norm)) if mask[i]]
+                            names_sub = [sample_names[i] for i in range(len(sample_names)) if mask[i]]
+                            indices_sub = [i for i in range(len(sample_names)) if mask[i]]
+
+                            is_both = (q_name == 'both')
+                            marker_size = 14 if is_both else 10
+                            marker_width = 3 if is_both else 1
+
+                            text_labels = names_sub if is_both else None
+                            text_pos = 'top center' if is_both else None
+
+                            customdata = np.array([[idx, n] for idx, n in zip(indices_sub, names_sub)])
+
+                            fig_joint.add_trace(go.Scatter(
+                                x=x_vals,
+                                y=y_vals,
+                                mode='markers' + ('+text' if is_both else ''),
+                                name=quadrant_names[q_name],
+                                text=text_labels,
+                                textposition=text_pos,
+                                textfont=dict(color=quadrant_colors[q_name], size=11, family='Arial Black'),
+                                marker=dict(
+                                    size=marker_size,
+                                    color=quadrant_colors[q_name],
+                                    line=dict(width=marker_width, color='black' if is_both else 'DarkSlateGrey'),
+                                ),
+                                customdata=customdata,
+                                hovertemplate=(
+                                    '<b>%{customdata[1]}</b><br>'
+                                    '归一化T²: %{x:.4f}<br>'
+                                    '归一化Q: %{y:.4f}<br>'
+                                    '象限: ' + quadrant_names[q_name] + '<extra></extra>'
+                                ),
+                            ))
+
+                        x_max = max(2.0, float(np.max(t2_norm) * 1.15))
+                        y_max = max(2.0, float(np.max(q_norm) * 1.15))
+
+                        fig_joint.add_vline(
+                            x=1.0,
                             line_dash="dash",
                             line_color="red",
-                            annotation_text=f"阈值 ({anomaly_result.mahalanobis_threshold:.2f})",
+                            line_width=1.5,
+                            annotation_text="T² 阈值",
                             annotation_position="top right",
                         )
-                        
-                        fig_mahal.update_layout(
-                            title="马氏距离 (到所属聚类质心)",
-                            xaxis_title="样品",
-                            yaxis_title="马氏距离",
-                            height=350,
-                            xaxis_tickangle=-45,
-                            margin=dict(l=10, r=10, t=40, b=80),
-                        )
-                        
-                        st.plotly_chart(fig_mahal, use_container_width=True)
-                        
-                        st.markdown("---")
-                        st.subheader("Hotelling T² 控制图")
-                        
-                        fig_t2 = go.Figure()
-                        
-                        colors_t2 = ['#1f77b4' if t <= anomaly_result.t2_threshold else 'red' 
-                                     for t in anomaly_result.hotelling_t2]
-                        
-                        fig_t2.add_trace(go.Scatter(
-                            x=sample_names,
-                            y=anomaly_result.hotelling_t2,
-                            mode='lines+markers',
-                            marker=dict(color=colors_t2, size=8),
-                            line=dict(color='#1f77b4', width=1.5),
-                            hovertemplate='%{x}<br>T²: %{y:.4f}<extra></extra>',
-                        ))
-                        
-                        fig_t2.add_hline(
-                            y=anomaly_result.t2_threshold,
+                        fig_joint.add_hline(
+                            y=1.0,
                             line_dash="dash",
                             line_color="red",
-                            annotation_text=f"95% UCL ({anomaly_result.t2_threshold:.2f})",
+                            line_width=1.5,
+                            annotation_text="Q 阈值",
                             annotation_position="top right",
                         )
-                        
-                        fig_t2.update_layout(
-                            title="Hotelling T² 统计量控制图",
-                            xaxis_title="样品",
-                            yaxis_title="T² 统计量",
-                            height=350,
-                            xaxis_tickangle=-45,
-                            margin=dict(l=10, r=10, t=40, b=80),
+
+                        fig_joint.add_shape(
+                            type="rect",
+                            x0=1.0, y0=1.0, x1=x_max, y1=y_max,
+                            fillcolor="rgba(214,39,40,0.06)",
+                            line_width=0,
                         )
-                        
-                        st.plotly_chart(fig_t2, use_container_width=True)
-                        
+                        fig_joint.add_shape(
+                            type="rect",
+                            x0=1.0, y0=0, x1=x_max, y1=1.0,
+                            fillcolor="rgba(255,127,14,0.06)",
+                            line_width=0,
+                        )
+                        fig_joint.add_shape(
+                            type="rect",
+                            x0=0, y0=1.0, x1=1.0, y1=y_max,
+                            fillcolor="rgba(255,204,0,0.06)",
+                            line_width=0,
+                        )
+
+                        fig_joint.add_annotation(
+                            x=x_max * 0.92, y=y_max * 0.92,
+                            text="🔴 双超限",
+                            showarrow=False,
+                            font=dict(color='#d62728', size=12),
+                            xanchor="right", yanchor="top",
+                        )
+                        fig_joint.add_annotation(
+                            x=x_max * 0.92, y=y_max * 0.08,
+                            text="🟠 仅T²",
+                            showarrow=False,
+                            font=dict(color='#ff7f0e', size=12),
+                            xanchor="right", yanchor="bottom",
+                        )
+                        fig_joint.add_annotation(
+                            x=x_max * 0.08, y=y_max * 0.92,
+                            text="🟡 仅Q",
+                            showarrow=False,
+                            font=dict(color='#c9a400', size=12),
+                            xanchor="left", yanchor="top",
+                        )
+                        fig_joint.add_annotation(
+                            x=x_max * 0.08, y=y_max * 0.08,
+                            text="⚪ 正常",
+                            showarrow=False,
+                            font=dict(color='#7f7f7f', size=12),
+                            xanchor="left", yanchor="bottom",
+                        )
+
+                        fig_joint.update_layout(
+                            title="T²-Q 联合诊断图 (归一化)",
+                            xaxis_title="归一化 T² (T² / T²_limit)",
+                            yaxis_title="归一化 Q (Q / Q_limit)",
+                            height=520,
+                            xaxis_range=[0, x_max],
+                            yaxis_range=[0, y_max],
+                            legend=dict(
+                                orientation="h",
+                                yanchor="bottom",
+                                y=1.02,
+                                xanchor="right",
+                                x=1
+                            ),
+                            margin=dict(l=10, r=10, t=60, b=40),
+                            clickmode='event+select',
+                        )
+
+                        joint_chart = st.plotly_chart(fig_joint, use_container_width=True)
+
+                        clicked = st.session_state.get("_clicked_anomaly", None)
+                        try:
+                            selection = joint_chart
+                        except Exception:
+                            selection = None
+
+                        st.markdown(
+                            f"<div style='font-size:13px;color:#666;margin-top:-10px;'>"
+                            f"👆 点击联合诊断图上的点可查看该样品的贡献度分析</div>",
+                            unsafe_allow_html=True
+                        )
+
                         st.markdown("---")
-                        st.subheader("Q残差 (SPE) 控制图")
-                        
-                        fig_q = go.Figure()
-                        
-                        colors_q = ['#1f77b4' if q <= anomaly_result.q_threshold else 'red' 
-                                    for q in anomaly_result.q_residuals]
-                        
-                        fig_q.add_trace(go.Scatter(
-                            x=sample_names,
-                            y=anomaly_result.q_residuals,
-                            mode='lines+markers',
-                            marker=dict(color=colors_q, size=8),
-                            line=dict(color='#1f77b4', width=1.5),
-                            hovertemplate='%{x}<br>Q残差: %{y:.4f}<extra></extra>',
-                        ))
-                        
-                        fig_q.add_hline(
-                            y=anomaly_result.q_threshold,
-                            line_dash="dash",
-                            line_color="red",
-                            annotation_text=f"95% UCL ({anomaly_result.q_threshold:.2f})",
-                            annotation_position="top right",
-                        )
-                        
-                        fig_q.update_layout(
-                            title="Q残差 (SPE) 控制图",
-                            xaxis_title="样品",
-                            yaxis_title="Q残差",
-                            height=350,
-                            xaxis_tickangle=-45,
-                            margin=dict(l=10, r=10, t=40, b=80),
-                        )
-                        
-                        st.plotly_chart(fig_q, use_container_width=True)
-                        
-                        st.markdown("---")
-                        st.subheader("异常样品列表")
-                        
-                        anomaly_data = []
+
+                        anomaly_sample_options = []
                         for i, name in enumerate(sample_names):
+                            tag = ""
+                            if quadrants[i] == 'both':
+                                tag = " 🔴"
+                            elif quadrants[i] == 't2_only':
+                                tag = " 🟠"
+                            elif quadrants[i] == 'q_only':
+                                tag = " 🟡"
+                            anomaly_sample_options.append((i, name + tag))
+
+                        selected_label = st.selectbox(
+                            "🔍 选择样品查看贡献度分析 (或直接点击上图散点)",
+                            range(len(anomaly_sample_options)),
+                            format_func=lambda idx: anomaly_sample_options[idx][1],
+                            index=st.session_state.selected_anomaly_idx if st.session_state.selected_anomaly_idx is not None else 0,
+                            key="contrib_sample_select",
+                        )
+                        st.session_state.selected_anomaly_idx = selected_label
+
+                        if st.session_state.selected_anomaly_idx is not None:
+                            sel_idx = int(st.session_state.selected_anomaly_idx)
+                            sel_name = sample_names[sel_idx]
+
+                            st.markdown(f"### 📊 贡献度分析 — <span style='color:#d62728;'>{sel_name}</span>", unsafe_allow_html=True)
+
+                            t2_contrib_sel = anomaly_result.t2_contributions[sel_idx]
+                            pc_labels = [f'PC{i+1}' for i in range(len(t2_contrib_sel))]
+
+                            fig_t2_contrib = go.Figure()
+                            fig_t2_contrib.add_trace(go.Bar(
+                                x=pc_labels,
+                                y=t2_contrib_sel,
+                                marker_color='#1f77b4',
+                                hovertemplate='%{x}<br>贡献度: %{y:.4f}<extra></extra>',
+                            ))
+                            fig_t2_contrib.update_layout(
+                                title=f"T² 贡献度 (主成分维度) — {sel_name}",
+                                xaxis_title="主成分",
+                                yaxis_title="贡献度 (score² / eigenvalue)",
+                                height=340,
+                                margin=dict(l=10, r=10, t=40, b=40),
+                            )
+                            st.plotly_chart(fig_t2_contrib, use_container_width=True)
+
+                            q_contrib_sel = anomaly_result.q_contributions[sel_idx]
+                            q_mean = float(np.mean(q_contrib_sel))
+                            q_threshold_mark = q_mean * 3.0
+
+                            fig_q_contrib = go.Figure()
+                            fig_q_contrib.add_trace(go.Bar(
+                                x=pca_result.common_x,
+                                y=q_contrib_sel,
+                                marker_color='#2ca02c',
+                                hovertemplate=(
+                                    f'{x_unit}: ' + '%{x:.4f}<br>'
+                                    'Q贡献度: %{y:.6f}<extra></extra>'
+                                ),
+                            ))
+                            fig_q_contrib.add_hline(
+                                y=q_threshold_mark,
+                                line_dash="dash",
+                                line_color="red",
+                                line_width=1.5,
+                                annotation_text=f"3倍均值阈值 ({q_threshold_mark:.4f})",
+                                annotation_position="top right",
+                            )
+
+                            high_mask = q_contrib_sel > q_threshold_mark
+                            if np.any(high_mask):
+                                high_x = pca_result.common_x[high_mask]
+                                high_y = q_contrib_sel[high_mask]
+                                for hx, hy in zip(high_x, high_y):
+                                    fig_q_contrib.add_annotation(
+                                        x=hx,
+                                        y=hy,
+                                        text=f"{hx:.2f}",
+                                        showarrow=True,
+                                        arrowhead=2,
+                                        arrowsize=1,
+                                        arrowwidth=1,
+                                        arrowcolor='red',
+                                        font=dict(size=9, color='red'),
+                                        yshift=12,
+                                    )
+
+                            fig_q_contrib.update_layout(
+                                title=f"Q 残差贡献度 ({x_unit}维度) — {sel_name}",
+                                xaxis_title=x_unit,
+                                yaxis_title="贡献度 (残差平方)",
+                                height=340,
+                                margin=dict(l=10, r=10, t=40, b=40),
+                            )
+                            st.plotly_chart(fig_q_contrib, use_container_width=True)
+
+                            st.markdown("---")
+
+                        st.subheader("📋 异常样品诊断")
+
+                        sorted_indices = list(range(len(sample_names)))
+
+                        for i in sorted_indices:
+                            name = sample_names[i]
                             is_mahal = i in anomaly_result.anomaly_indices_mahal
                             is_t2 = i in anomaly_result.anomaly_indices_t2
                             is_q = i in anomaly_result.anomaly_indices_q
                             is_anomaly = is_mahal or is_t2 or is_q
-                            
-                            anomaly_data.append({
-                                "样品名称": name,
-                                "马氏距离": f"{anomaly_result.mahalanobis_distances[i]:.4f}",
-                                "马氏距离超限": "⚠️" if is_mahal else "✅",
-                                "T²超限": "⚠️" if is_t2 else "✅",
-                                "Q残差超限": "⚠️" if is_q else "✅",
-                                "异常标记": "🔴 异常" if is_anomaly else "🟢 正常",
-                            })
-                        
-                        st.dataframe(pd.DataFrame(anomaly_data), use_container_width=True, hide_index=True)
-                        
-                        if anomaly_result.anomaly_samples:
-                            st.warning(f"⚠️ 检测到 {len(anomaly_result.anomaly_samples)} 个异常样品: {', '.join(anomaly_result.anomaly_samples)}")
+                            quad = quadrants[i]
+
+                            icon = "🔴" if quad == 'both' else ("🟠" if quad == 't2_only' else ("🟡" if quad == 'q_only' else "🟢"))
+                            exp_title = f"{icon} {name} — {quadrant_names.get(quad, '正常')}"
+
+                            with st.expander(exp_title, expanded=is_anomaly):
+                                col_a, col_b = st.columns(2)
+                                with col_a:
+                                    st.metric("归一化 T²", f"{t2_norm[i]:.4f}",
+                                              delta="超限" if t2_norm[i] > 1 else "正常",
+                                              delta_color="inverse")
+                                    st.metric("归一化 Q", f"{q_norm[i]:.4f}",
+                                              delta="超限" if q_norm[i] > 1 else "正常",
+                                              delta_color="inverse")
+                                with col_b:
+                                    st.metric("所属象限", quadrant_names.get(quad, "正常"))
+                                    st.metric("马氏距离", f"{anomaly_result.mahalanobis_distances[i]:.4f}")
+
+                                st.markdown("**Top-3 T² 贡献主成分**:")
+                                top_t2 = get_top_t2_contributions(
+                                    anomaly_result.t2_contributions, i, top_k=3
+                                )
+                                t2_cols = st.columns(3)
+                                for ci, (pc_num, val) in enumerate(top_t2):
+                                    with t2_cols[ci]:
+                                        st.info(f"**PC{pc_num}**\n\n贡献值: {val:.4f}")
+
+                                st.markdown(f"**Top-5 Q 贡献{x_unit}位置**:")
+                                top_q = get_top_q_contributions(
+                                    anomaly_result.q_contributions, pca_result.common_x, i, top_k=5
+                                )
+                                q_data = []
+                                for xv, val in top_q:
+                                    q_data.append({
+                                        f"{x_unit}位置": f"{xv:.4f}",
+                                        "贡献值": f"{val:.6f}",
+                                    })
+                                if q_data:
+                                    st.dataframe(pd.DataFrame(q_data), use_container_width=True, hide_index=True)
+
+                        st.markdown("---")
+
+                        if enable_trend and len(sample_names) >= 3:
+                            st.subheader("📈 趋势分析面板")
+
+                            ma_window = trend_window
+                            t2_ma = compute_moving_average(t2_norm, ma_window)
+                            q_ma = compute_moving_average(q_norm, ma_window)
+
+                            t2_total_slope, t2_recent_slope = compute_trend_slope(t2_ma, window=3)
+                            q_total_slope, q_recent_slope = compute_trend_slope(q_ma, window=3)
+
+                            t2_ma_mean = float(np.nanmean(np.abs(t2_ma))) if np.any(~np.isnan(t2_ma)) else 1.0
+                            q_ma_mean = float(np.nanmean(np.abs(q_ma))) if np.any(~np.isnan(q_ma)) else 1.0
+                            t2_warn = (t2_recent_slope > 0) and (t2_recent_slope > 0.5 * max(abs(t2_total_slope), t2_ma_mean / max(len(sample_names), 1)))
+                            q_warn = (q_recent_slope > 0) and (q_recent_slope > 0.5 * max(abs(q_total_slope), q_ma_mean / max(len(sample_names), 1)))
+
+                            if t2_warn or q_warn:
+                                st.error("⚠️ **检测到异常趋势，建议关注**")
+                                warn_details = []
+                                if t2_warn:
+                                    warn_details.append(f"T²统计量移动平均呈显著递增趋势 (近期斜率={t2_recent_slope:.4f})")
+                                if q_warn:
+                                    warn_details.append(f"Q残差移动平均呈显著递增趋势 (近期斜率={q_recent_slope:.4f})")
+                                for w in warn_details:
+                                    st.warning(w)
+
+                            fig_trend = make_subplots(
+                                rows=2, cols=1,
+                                shared_xaxes=True,
+                                row_heights=[0.5, 0.5],
+                                vertical_spacing=0.08,
+                                subplot_titles=("归一化 T² 时序", "归一化 Q 时序"),
+                            )
+
+                            fig_trend.add_trace(go.Scatter(
+                                x=sample_names,
+                                y=t2_norm,
+                                mode='lines+markers',
+                                name='T² 原始',
+                                marker=dict(color='#1f77b4', size=6),
+                                line=dict(color='#1f77b4', width=1),
+                                hovertemplate='%{x}<br>T²: %{y:.4f}<extra></extra>',
+                            ), row=1, col=1)
+                            fig_trend.add_trace(go.Scatter(
+                                x=sample_names,
+                                y=t2_ma,
+                                mode='lines',
+                                name=f'T² MA({ma_window})',
+                                line=dict(color='#d62728', width=2.5, dash='solid'),
+                                hovertemplate='%{x}<br>T² MA: %{y:.4f}<extra></extra>',
+                            ), row=1, col=1)
+                            fig_trend.add_hline(
+                                y=1.0,
+                                line_dash="dash",
+                                line_color="red",
+                                line_width=1.2,
+                                annotation_text="阈值",
+                                annotation_position="top right",
+                                row=1, col=1,
+                            )
+
+                            fig_trend.add_trace(go.Scatter(
+                                x=sample_names,
+                                y=q_norm,
+                                mode='lines+markers',
+                                name='Q 原始',
+                                marker=dict(color='#2ca02c', size=6),
+                                line=dict(color='#2ca02c', width=1),
+                                hovertemplate='%{x}<br>Q: %{y:.4f}<extra></extra>',
+                            ), row=2, col=1)
+                            fig_trend.add_trace(go.Scatter(
+                                x=sample_names,
+                                y=q_ma,
+                                mode='lines',
+                                name=f'Q MA({ma_window})',
+                                line=dict(color='#ff7f0e', width=2.5, dash='solid'),
+                                hovertemplate='%{x}<br>Q MA: %{y:.4f}<extra></extra>',
+                            ), row=2, col=1)
+                            fig_trend.add_hline(
+                                y=1.0,
+                                line_dash="dash",
+                                line_color="red",
+                                line_width=1.2,
+                                annotation_text="阈值",
+                                annotation_position="top right",
+                                row=2, col=1,
+                            )
+
+                            fig_trend.update_layout(
+                                height=520,
+                                xaxis_tickangle=-45,
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                margin=dict(l=10, r=10, t=60, b=60),
+                            )
+                            fig_trend.update_yaxes(title_text="归一化 T²", row=1, col=1)
+                            fig_trend.update_yaxes(title_text="归一化 Q", row=2, col=1)
+                            fig_trend.update_xaxes(title_text="样品 (时序)", row=2, col=1)
+
+                            st.plotly_chart(fig_trend, use_container_width=True)
+
+                            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                            with col_s1:
+                                st.metric("T² 总斜率", f"{t2_total_slope:.4f}")
+                            with col_s2:
+                                st.metric("T² 近期(3点)斜率", f"{t2_recent_slope:.4f}",
+                                          delta="⚠ 上升" if t2_warn else "",
+                                          delta_color="inverse")
+                            with col_s3:
+                                st.metric("Q 总斜率", f"{q_total_slope:.4f}")
+                            with col_s4:
+                                st.metric("Q 近期(3点)斜率", f"{q_recent_slope:.4f}",
+                                          delta="⚠ 上升" if q_warn else "",
+                                          delta_color="inverse")
+
+                            st.markdown("---")
+
+                        total_anomaly = len(anomaly_result.anomaly_samples)
+                        if total_anomaly > 0:
+                            st.warning(
+                                f"⚠️ 检测到 {total_anomaly} 个异常样品: "
+                                f"{', '.join(anomaly_result.anomaly_samples)}"
+                            )
                         else:
                             st.success("✅ 所有样品均为正常")
                     else:
