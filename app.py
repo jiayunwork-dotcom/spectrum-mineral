@@ -2354,29 +2354,11 @@ elif page == "📊 PCA与分类":
                             margin=dict(l=10, r=10, t=60, b=40),
                         )
 
-                        def _on_joint_select(sel_event):
-                            try:
-                                if sel_event and sel_event.selection and sel_event.selection.points:
-                                    pt = sel_event.selection.points[0]
-                                    if hasattr(pt, 'customdata') and pt.customdata is not None and len(pt.customdata) > 0:
-                                        clicked_idx = int(pt.customdata[0])
-                                        if 0 <= clicked_idx < len(sample_names):
-                                            st.session_state.selected_anomaly_idx = clicked_idx
-                                            st.rerun()
-                            except Exception:
-                                pass
-
-                        joint_chart = st.plotly_chart(
-                            fig_joint,
-                            use_container_width=True,
-                            selection_mode="points",
-                            on_select=_on_joint_select,
-                            key="joint_diagnosis_chart",
-                        )
+                        st.plotly_chart(fig_joint, use_container_width=True)
 
                         st.markdown(
                             f"<div style='font-size:13px;color:#666;margin-top:-10px;'>"
-                            f"👆 点击联合诊断图上的散点可查看该样品的贡献度分析</div>",
+                            f"💡 使用下方下拉框选择样品查看贡献度分析</div>",
                             unsafe_allow_html=True
                         )
 
@@ -2541,29 +2523,27 @@ elif page == "📊 PCA与分类":
                             t2_total_slope, t2_recent_slope = compute_trend_slope(t2_ma, window=3)
                             q_total_slope, q_recent_slope = compute_trend_slope(q_ma, window=3)
 
-                            n_samples = len(sample_names)
-                            t2_valid = t2_norm[~np.isnan(t2_norm)]
-                            q_valid = q_norm[~np.isnan(q_norm)]
+                            t2_ma_valid = t2_ma[~np.isnan(t2_ma)]
+                            q_ma_valid = q_ma[~np.isnan(q_ma)]
 
-                            t2_trend_up = len(t2_valid) >= 4 and (t2_valid[-1] > t2_valid[0] * 1.1 or np.mean(t2_valid[-3:]) > np.mean(t2_valid[:3]) * 1.1)
-                            q_trend_up = len(q_valid) >= 4 and (q_valid[-1] > q_valid[0] * 1.1 or np.mean(q_valid[-3:]) > np.mean(q_valid[:3]) * 1.1)
+                            t2_warn = False
+                            q_warn = False
 
-                            t2_range_raw = float(t2_valid.max() - t2_valid.min()) if len(t2_valid) > 0 else 0.0
-                            q_range_raw = float(q_valid.max() - q_valid.min()) if len(q_valid) > 0 else 0.0
-                            t2_min_slope = max(0.003, t2_range_raw / max(n_samples, 1) * 0.2)
-                            q_min_slope = max(0.003, q_range_raw / max(n_samples, 1) * 0.2)
+                            if len(t2_ma_valid) >= 4:
+                                t2_end_gt_start = t2_ma_valid[-1] > t2_ma_valid[0] * 1.05
+                                t2_mean_first3 = float(np.mean(t2_ma_valid[:3]))
+                                t2_mean_last3 = float(np.mean(t2_ma_valid[-3:]))
+                                t2_mean_gt = t2_mean_last3 > t2_mean_first3 * 1.1
+                                t2_recent_pos = t2_recent_slope > 0
+                                t2_warn = (t2_end_gt_start or t2_mean_gt) and t2_recent_pos
 
-                            t2_slope_cond = (t2_recent_slope > 0) and (
-                                (t2_total_slope > 0 and t2_recent_slope > 0.5 * abs(t2_total_slope)) or
-                                (t2_recent_slope > t2_min_slope)
-                            )
-                            q_slope_cond = (q_recent_slope > 0) and (
-                                (q_total_slope > 0 and q_recent_slope > 0.5 * abs(q_total_slope)) or
-                                (q_recent_slope > q_min_slope)
-                            )
-
-                            t2_warn = (t2_trend_up or (t2_total_slope > 0)) and t2_slope_cond
-                            q_warn = (q_trend_up or (q_total_slope > 0)) and q_slope_cond
+                            if len(q_ma_valid) >= 4:
+                                q_end_gt_start = q_ma_valid[-1] > q_ma_valid[0] * 1.05
+                                q_mean_first3 = float(np.mean(q_ma_valid[:3]))
+                                q_mean_last3 = float(np.mean(q_ma_valid[-3:]))
+                                q_mean_gt = q_mean_last3 > q_mean_first3 * 1.1
+                                q_recent_pos = q_recent_slope > 0
+                                q_warn = (q_end_gt_start or q_mean_gt) and q_recent_pos
 
                             if t2_warn or q_warn:
                                 st.error("⚠️ **检测到异常趋势，建议关注**")
